@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D Satellite Collision Simulator</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; color: #0ff; }
+#canvas-container { width: 100vw; height: 100vh; }
+#hud {
+  position: fixed; top: 16px; left: 16px; z-index: 100;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.hud-btn {
+  background: rgba(0,0,0,0.7); border: 1px solid #0ff;
+  color: #0ff; padding: 8px 16px; cursor: pointer;
+  font-family: 'Courier New', monospace; font-size: 12px;
+  text-transform: uppercase; letter-spacing: 1px;
+  transition: all 0.2s;
+}
+.hud-btn:hover { background: rgba(0,255,255,0.15); }
+.hud-btn.active { background: rgba(0,255,255,0.3); border-color: #fff; color: #fff; }
+.hud-slider { display: flex; align-items: center; gap: 8px; }
+.hud-slider label { font-size: 11px; white-space: nowrap; }
+.hud-slider input { width: 100px; accent-color: #0ff; }
+#telemetry {
+  position: fixed; top: 16px; right: 16px; z-index: 100;
+  background: rgba(0,0,0,0.8); border: 1px solid #0ff;
+  padding: 12px 16px; min-width: 200px;
+  display: none;
+}
+#telemetry h3 { font-size: 12px; color: #0ff; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+.tele-row { display: flex; justify-content: space-between; gap: 16px; font-size: 12px; margin: 4px 0; }
+.tele-label { color: #888; }
+.tele-val { color: #0ff; font-weight: bold; }
+#velocity-input { display: flex; gap: 6px; margin-top: 8px; }
+#velocity-input input {
+  background: rgba(0,255,255,0.1); border: 1px solid #0ff;
+  color: #0ff; padding: 4px 8px; font-family: 'Courier New', monospace;
+  font-size: 12px; width: 80px;
+}
+#velocity-input button {
+  background: rgba(0,255,255,0.2); border: 1px solid #0ff;
+  color: #0ff; padding: 4px 8px; cursor: pointer;
+  font-family: 'Courier New', monospace; font-size: 11px;
+}
+#stats {
+  position: fixed; bottom: 16px; left: 16px; z-index: 100;
+  font-size: 11px; color: #888;
+  background: rgba(0,0,0,0.6); padding: 8px 12px;
+}
+#crosshair {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  color: rgba(0,255,255,0.4); font-size: 20px; pointer-events: none;
+  display: none;
+}
+</style>
+</head>
+<body>
+<div id="canvas-container"></div>
+
+<div id="hud">
+  <button class="hud-btn" id="btn-addmode">+ Add Mode: OFF</button>
+  <button class="hud-btn" id="btn-reset">Reset</button>
+  <div class="hud-slider">
+    <label>Time Scale:</label>
+    <input type="range" id="timescale" min="0.1" max="5" step="0.1" value="1">
+    <span id="timescale-val">1.0x</span>
+  </div>
+  <div class="hud-slider">
+    <label>Collision Radius:</label>
+    <input type="range" id="collradius" min="0.5" max="5" step="0.1" value="1.5">
+    <span id="collradius-val">1.5</span>
+  </div>
+</div>
+
+<div id="telemetry">
+  <h3>Satellite Telemetry</h3>
+  <div class="tele-row"><span class="tele-label">ID</span><span class="tele-val" id="t-id">-</span></div>
+  <div class="tele-row"><span class="tele-label">Velocity</span><span class="tele-val" id="t-vel">-</span></div>
+  <div class="tele-row"><span class="tele-label">Temperature</span><span class="tele-val" id="t-temp">-</span></div>
+  <div class="tele-row"><span class="tele-label">Type</span><span class="tele-val" id="t-type">-</span></div>
+  <div class="tele-row"><span class="tele-label">Orbit Alt</span><span class="tele-val" id="t-alt">-</span></div>
+  <div id="velocity-input">
+    <input type="number" id="vel-input" placeholder="km/s" step="0.1">
+    <button id="btn-setvel">Set</button>
+  </div>
+</div>
+
+<div id="stats">
+  Satellites: <span id="stat-sats">0</span> |
+  Debris: <span id="stat-debris">0</span> |
+  Collisions: <span id="stat-colls">0</span>
+</div>
+
+<div id="crosshair">+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
+camera.position.set(0, 30, 80);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+let isAddMode = false;
+let selectedObject = null;
+let timeScale = 1.0;
+let collisionRadius = 1.5;
+let totalCollisions = 0;
+let objects = [];
+let debrisParticles = [];
+let flashEffects = [];
+
+// OrbitControls inline
+class OrbitControls {
+  constructor(cam, domEl) {
+    this.camera = cam; this.domElement = domEl;
+    this.target = new THREE.Vector3();
+    this.minDistance = 20; this.maxDistance = 400;
+    this._spherical = new THREE.Spherical().setFromVector3(cam.position);
+    this._isDragging = false; this._lastPos = { x: 0, y: 0 };
+    this._scale = 1;
+    domEl.addEventListener('mousedown', e => { this._isDragging = true; this._lastPos = { x: e.clientX, y: e.clientY }; });
+    domEl.addEventListener('mousemove', e => {
+      if (!this._isDragging) return;
+      const dx = e.clientX - this._lastPos.x;
+      const dy = e.clientY - this._lastPos.y;
+      this._spherical.theta -= dx * 0.005;
+      this._spherical.phi -= dy * 0.005;
+      this._spherical.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this._spherical.phi));
+      this._lastPos = { x: e.clientX, y: e.clientY };
+    });
+    domEl.addEventListener('mouseup', () => { this._isDragging = false; });
+    domEl.addEventListener('wheel', e => {
+      this._spherical.radius *= (1 + e.deltaY * 0.001);
+      this._spherical.radius = Math.max(this.minDistance, Math.min(this.maxDistance, this._spherical.radius));
+    });
+    domEl.addEventListener('touchstart', e => {
+      if (e.touches.length === 1) { this._isDragging = true; this._lastPos = { x: e.touches[0].clientX, y: e.touches[0].clientY }; }
+    });
+    domEl.addEventListener('touchmove', e => {
+      if (!this._isDragging || e.touches.length !== 1) return;
+      const dx = e.touches[0].clientX - this._lastPos.x;
+      const dy = e.touches[0].clientY - this._lastPos.y;
+      this._spherical.theta -= dx * 0.005;
+      this._spherical.phi -= dy * 0.005;
+      this._spherical.phi = Math.max(0.05, Math.min(Math.PI - 0.05, this._spherical.phi));
+      this._lastPos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    });
+    domEl.addEventListener('touchend', () => { this._isDragging = false; });
+  }
+  update() {
+    const pos = new THREE.Vector3().setFromSpherical(this._spherical).add(this.target);
+    this.camera.position.copy(pos);
+    this.camera.lookAt(this.target);
+  }
+}
+
+const controls = new OrbitControls(camera, renderer.domElement);
+
+// Lighting
+scene.add(new THREE.AmbientLight(0x222244, 1));
+const sunLight = new THREE.DirectionalLight(0xffeedd, 1.5);
+sunLight.position.set(100, 50, 100);
+scene.add(sunLight);
+
+// Stars
+const starGeo = new THREE.BufferGeometry();
+const starVerts = [];
+for (let i = 0; i < 8000; i++) {
+  const r = 800 + Math.random() * 400;
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  starVerts.push(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+}
+starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starVerts, 3));
+scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.5 })));
+
+// Earth
+const earthGeo = new THREE.SphereGeometry(20, 64, 64);
+const earthMat = new THREE.MeshPhongMaterial({
+  color: 0x1a6699, emissive: 0x0a1a33, specular: 0x4499bb, shininess: 30
+});
+const earthMesh = new THREE.Mesh(earthGeo, earthMat);
+scene.add(earthMesh);
+
+// Clouds layer
+const cloudGeo = new THREE.SphereGeometry(20.3, 32, 32);
+const cloudMat = new THREE.MeshPhongMaterial({
+  color: 0xffffff, transparent: true, opacity: 0.25, depthWrite: false
+});
+scene.add(new THREE.Mesh(cloudGeo, cloudMat));
+
+// Atmosphere glow
+const atmGeo = new THREE.SphereGeometry(21, 32, 32);
+const atmMat = new THREE.MeshPhongMaterial({
+  color: 0x0044ff, transparent: true, opacity: 0.08, side: THREE.BackSide
+});
+scene.add(new THREE.Mesh(atmGeo, atmMat));
+
+// Continents outline suggestion
+const continentGeo = new THREE.SphereGeometry(20.05, 32, 32);
+const continentMat = new THREE.MeshPhongMaterial({
+  color: 0x2d8a4e, transparent: true, opacity: 0.6,
+  wireframe: false
+});
+
+// Create landmass patches
+function addLandPatch(lat, lon, size, color = 0x2d8a4e) {
+  const phi = (90 - lat) * Math.PI / 180;
+  const theta = lon * Math.PI / 180;
+  const r = 20.05;
+  const x = r * Math.sin(phi) * Math.cos(theta);
+  const y = r * Math.cos(phi);
+  const z = r * Math.sin(phi) * Math.sin(theta);
+  const geo = new THREE.SphereGeometry(size, 8, 8);
+  const mat = new THREE.MeshPhongMaterial({ color, transparent: true, opacity: 0.8 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y, z);
+  scene.add(mesh);
+}
+// Rough continent approximations
+[[45,10,4],[60,20,3],[55,40,3],[40,70,4],[25,80,3],[20,30,5],[5,20,4],[-20,25,3],
+ [40,-100,5],[55,-90,3],[30,-90,4],[-15,-55,4],[-30,-65,3],[60,-140,3],
+ [-25,130,3],[-30,150,3],[0,110,3],[35,115,4]].forEach(([la,lo,s]) => addLandPatch(la,lo,s));
+
+// Satellite class
+class Satellite {
+  constructor(id, position, velocity, isDebris = false, parentId = null) {
+    this.id = id;
+    this.isDebris = isDebris;
+    this.parentId = parentId;
+    this.temperature = 290 + Math.random() * 10;
+    this.alive = true;
+    this.mass = isDebris ? 0.1 + Math.random() * 0.5 : 1.0;
+
+    const size = isDebris ? 0.15 + Math.random() * 0.2 : 0.4 + Math.random() * 0.3;
+    let geo, mat;
+    if (isDebris) {
+      geo = new THREE.TetrahedronGeometry(size);
+      mat = new THREE.MeshPhongMaterial({ color: 0xaa7733, emissive: 0x331100 });
+    } else {
+      geo = new THREE.BoxGeometry(size * 2, size * 0.5, size);
+      mat = new THREE.MeshPhongMaterial({ color: 0x8899bb, emissive: 0x112233, specular: 0x334455, shininess: 60 });
+    }
+
+    this.mesh = new THREE.Mesh(geo, mat);
+    this.mesh.position.copy(position);
+    this.mesh.userData.satRef = this;
+
+    // Solar panels
+    if (!isDebris) {
+      const panelGeo = new THREE.BoxGeometry(size * 2, size * 0.05, size * 0.6);
+      const panelMat = new THREE.MeshPhongMaterial({ color: 0x223366, emissive: 0x001133 });
+      const p1 = new THREE.Mesh(panelGeo, panelMat);
+      p1.position.set(size * 1.5, 0, 0);
+      const p2 = p1.clone();
+      p2.position.set(-size * 1.5, 0, 0);
+      this.mesh.add(p1, p2);
+    }
+
+    this.velocity = velocity.clone();
+    scene.add(this.mesh);
+  }
+
+  update(dt) {
+    if (!this.alive) return;
+    const pos = this.mesh.position;
+    const dist = pos.length();
+    const G = 400;
+    const grav = pos.clone().normalize().multiplyScalar(-G / (dist * dist));
+    this.velocity.add(grav.multiplyScalar(dt));
+    pos.add(this.velocity.clone().multiplyScalar(dt));
+    this.mesh.lookAt(pos.clone().add(this.velocity));
+    this.temperature = Math.max(this.isDebris ? 200 : 270, this.temperature - dt * 15);
+    this.updateColor();
+  }
+
+  updateColor() {
+    const t = Math.min(1, (this.temperature - 270) / 1500);
+    if (t > 0.01) {
+      const r = Math.min(1, t * 2);
+      const g = Math.max(0, t < 0.5 ? t * 2 : 1 - (t - 0.5) * 2) * 0.5;
+      this.mesh.material.emissive.setRGB(r * 0.8, g, 0);
+    } else {
+      this.mesh.material.emissive.setHex(this.isDebris ? 0x110800 : 0x112233);
+    }
+  }
+
+  destroy() {
+    this.alive = false;
+    scene.remove(this.mesh);
+  }
+}
+
+// Flash effect at collision point
+function createFlash(position) {
+  const geo = new THREE.SphereGeometry(0.8, 8, 8);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xff6600, transparent: true, opacity: 1 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(position);
+  scene.add(mesh);
+  flashEffects.push({ mesh, life: 1.5, maxLife: 1.5 });
+
+  // Ring shockwave
+  const ringGeo = new THREE.RingGeometry(0.5, 1.2, 16);
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0xff9900, transparent: true, opacity: 0.8, side: THREE.DoubleSide });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.position.copy(position);
+  ring.lookAt(camera.position);
+  scene.add(ring);
+  flashEffects.push({ mesh: ring, life: 1.0, maxLife: 1.0, isRing: true });
+}
+
+let debrisIdCounter = 10000;
+
+function spawnDebris(position, parentVelocity, count = 8) {
+  const newDebris = [];
+  for (let i = 0; i < count; i++) {
+    const spread = new THREE.Vector3(
+      (Math.random() - 0.5) * 8,
+      (Math.random() - 0.5) * 8,
+      (Math.random() - 0.5) * 8
+    );
+    const vel = parentVelocity.clone().multiplyScalar(0.5).add(spread);
+    const pos = position.clone().add(new THREE.Vector3(
+      (Math.random() - 0.5) * 2,
+      (Math.random() - 0.5) * 2,
+      (Math.random() - 0.5) * 2
+    ));
+    if (pos.length() < 21) pos.normalize().multiplyScalar(22);
+    const d = new Satellite(debrisIdCounter++, pos, vel, true);
+    d.temperature = 1800 + Math.random() * 500;
+    newDebris.push(d);
+    debrisParticles.push(d);
+    objects.push(d);
+  }
+  return newDebris;
+}
+
+let satIdCounter = 0;
+
+function createSatellite(altKm, inclinationDeg, isCustom = false) {
+  const R_EARTH = 20;
+  const scale = R_EARTH / 6371;
+  const alt = altKm * scale;
+  const r = R_EARTH + alt;
+  const theta = Math.random() * Math.PI * 2;
+  const inc = inclinationDeg * Math.PI / 180;
+  const x = r * Math.cos(theta);
+  const y = r * Math.sin(theta) * Math.sin(inc);
+  const z = r * Math.sin(theta) * Math.cos(inc);
+  const pos = new THREE.Vector3(x, y, z);
+  const orbSpeed = Math.sqrt(400 / r) * (0.9 + Math.random() * 0.2);
+  const tangent = new THREE.Vector3(-Math.sin(theta), Math.cos(theta) * Math.sin(inc), Math.cos(theta) * Math.cos(inc));
+  const vel = tangent.multiplyScalar(orbSpeed);
+  const sat = new Satellite(satIdCounter++, pos, vel, false);
+  sat.altKm = altKm;
+  sat.isCustom = isCustom;
+  return sat;
+}
+
+// Orbit configs mirroring real zones
+const ORBIT_CONFIGS = [
+  { alt: 400, inc: 51.6, count: 6, name: 'LEO ISS Zone' },
+  { alt: 550, inc: 53, count: 10, name: 'Starlink Shell' },
+  { alt: 1200, inc: 66, count: 6, name: 'LEO High' },
+  { alt: 20200, inc: 55, count: 8, name: 'MEO GPS' },
+  { alt: 35786, inc: 0, count: 8, name: 'GEO Belt' },
+  { alt: 19100, inc: 64.8, count: 6, name: 'GLONASS' },
+  { alt: 23222, inc: 56, count: 6, name: 'Galileo' },
+];
+
+function initSatellites() {
+  ORBIT_CONFIGS.forEach(cfg => {
+    for (let i = 0; i < cfg.count; i++) {
+      const inc = cfg.inc + (Math.random() - 0.5) * 5;
+      objects.push(createSatellite(cfg.alt, inc));
+    }
+  });
+}
+
+initSatellites();
+
+// Orbit rings (visual)
+function addOrbitRing(alt, inc, color = 0x113344) {
+  const R = 20;
+  const scale = R / 6371;
+  const r = R + alt * scale;
+  const pts = [];
+  for (let i = 0; i <= 128; i++) {
+    const a = (i / 128) * Math.PI * 2;
+    pts.push(new THREE.Vector3(r * Math.cos(a), r * Math.sin(a) * Math.sin(inc * Math.PI / 180), r * Math.sin(a) * Math.cos(inc * Math.PI / 180)));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  scene.add(new THREE.Line(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.2 })));
+}
+
+ORBIT_CONFIGS.forEach(cfg => addOrbitRing(cfg.alt, cfg.inc));
+
+// Raycaster for click
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('click', e => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+
+  const meshes = objects.filter(o => o.alive).map(o => o.mesh);
+  const hits = raycaster.intersectObjects(meshes, true);
+
+  if (hits.length > 0) {
+    let mesh = hits[0].object;
+    while (mesh.parent && !mesh.userData.satRef) mesh = mesh.parent;
+    if (mesh.userData.satRef) {
+      selectedObject = mesh.userData.satRef;
+      showTelemetry(selectedObject);
+      return;
+    }
+  }
+
+  if (isAddMode) {
+    const dir = raycaster.ray.direction.clone();
+    const dist = 50 + Math.random() * 20;
+    const pos = camera.position.clone().add(dir.multiplyScalar(dist));
+    if (pos.length() < 22) pos.normalize().multiplyScalar(25);
+    const vel = pos.clone().cross(new THREE.Vector3(0, 1, 0)).normalize().multiplyScalar(3 + Math.random() * 2);
+    const sat = new Satellite(satIdCounter++, pos, vel, false);
+    sat.isCustom = true;
+    objects.push(sat);
+    selectedObject = sat;
+    showTelemetry(sat);
+  }
+});
+
+function showTelemetry(sat) {
+  const tel = document.getElementById('telemetry');
+  tel.style.display = 'block';
+  document.getElementById('t-id').textContent = `SAT-${sat.id}`;
+  document.getElementById('t-type').textContent = sat.isDebris ? 'DEBRIS' : sat.isCustom ? 'USER SAT' : 'ACTIVE SAT';
+}
+
+function updateTelemetry() {
+  if (!selectedObject || !selectedObject.alive) {
+    if (selectedObject && !selectedObject.alive) {
+      document.getElementById('t-id').textContent += ' [DESTROYED]';
+    }
+    return;
+  }
+  const v = selectedObject.velocity.length();
+  const R_EARTH = 20;
+  const scale = 6371 / R_EARTH;
+  const altReal = (selectedObject.mesh.position.length() - R_EARTH) * scale;
+  const vReal = v * (7.9 / 3);
+  document.getElementById('t-vel').textContent = vReal.toFixed(2) + ' km/s';
+  document.getElementById('t-temp').textContent = Math.round(selectedObject.temperature) + ' K';
+  document.getElementById('t-alt').textContent = Math.round(altReal) + ' km';
+}
+
+document.getElementById('btn-setvel').addEventListener('click', () => {
+  if (!selectedObject || !selectedObject.alive) return;
+  const newV = parseFloat(document.getElementById('vel-input').value);
+  if (isNaN(newV)) return;
+  const scale = 3 / 7.9;
+  selectedObject.velocity.normalize().multiplyScalar(newV * scale);
+});
+
+document.getElementById('btn-addmode').addEventListener('click', () => {
+  isAddMode = !isAddMode;
+  const btn = document.getElementById('btn-addmode');
+  btn.textContent = `+ Add Mode: ${isAddMode ? 'ON' : 'OFF'}`;
+  btn.classList.toggle('active', isAddMode);
+  document.getElementById('crosshair').style.display = isAddMode ? 'block' : 'none';
+});
+
+document.getElementById('btn-reset').addEventListener('click', () => {
+  objects.forEach(o => o.destroy());
+  debrisParticles.forEach(d => d.destroy());
+  flashEffects.forEach(f => scene.remove(f.mesh));
+  objects = []; debrisParticles = []; flashEffects = [];
+  selectedObject = null;
+  totalCollisions = 0;
+  satIdCounter = 0; debrisIdCounter = 10000;
+  document.getElementById('telemetry').style.display = 'none';
+  initSatellites();
+});
+
+document.getElementById('timescale').addEventListener('input', e => {
+  timeScale = parseFloat(e.target.value);
+  document.getElementById('timescale-val').textContent = timeScale.toFixed(1) + 'x';
+});
+
+document.getElementById('collradius').addEventListener('input', e => {
+  collisionRadius = parseFloat(e.target.value);
+  document.getElementById('collradius-val').textContent = collisionRadius.toFixed(1);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Physics collision detection
+function checkCollisions() {
+  const alive = objects.filter(o => o.alive);
+  const toDestroy = new Set();
+  const toSpawn = [];
+
+  for (let i = 0; i < alive.length; i++) {
+    for (let j = i + 1; j < alive.length; j++) {
+      const a = alive[i], b = alive[j];
+      if (toDestroy.has(a) || toDestroy.has(b)) continue;
+      const dist = a.mesh.position.distanceTo(b.mesh.position);
+      if (dist < collisionRadius) {
+        totalCollisions++;
+        const collPt = a.mesh.position.clone().add(b.mesh.position).multiplyScalar(0.5);
+        createFlash(collPt);
+
+        // Conservation of momentum
+        const totalMass = a.mass + b.mass;
+        const newVel = a.velocity.clone().multiplyScalar(a.mass)
+          .add(b.velocity.clone().multiplyScalar(b.mass))
+          .divideScalar(totalMass);
+
+        const debrisCountA = a.isDebris ? 3 : 8 + Math.floor(Math.random() * 3);
+        const debrisCountB = b.isDebris ? 3 : 8 + Math.floor(Math.random() * 3);
+
+        toSpawn.push({ pos: collPt, vel: newVel.clone().add(a.velocity.clone().multiplyScalar(0.3)), count: debrisCountA });
+        toSpawn.push({ pos: collPt, vel: newVel.clone().add(b.velocity.clone().multiplyScalar(0.3)), count: debrisCountB });
+
+        toDestroy.add(a);
+        toDestroy.add(b);
+      }
+    }
+  }
+
+  toDestroy.forEach(o => {
+    o.destroy();
+    objects = objects.filter(x => x !== o);
+    debrisParticles = debrisParticles.filter(x => x !== o);
+    if (selectedObject === o) {
+      document.getElementById('t-id').textContent += ' [DESTROYED]';
+    }
+  });
+
+  toSpawn.forEach(s => spawnDebris(s.pos, s.vel, s.count));
+}
+
+let lastTime = performance.now();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const rawDt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime = now;
+  const dt = rawDt * timeScale;
+
+  earthMesh.rotation.y += dt * 0.05;
+
+  objects.forEach(o => { if (o.alive) o.update(dt); });
+
+  // Remove objects that fell into Earth
+  objects = objects.filter(o => {
+    if (!o.alive) return false;
+    if (o.mesh.position.length() < 19) { o.destroy(); return false; }
+    return true;
+  });
+  debrisParticles = debrisParticles.filter(o => o.alive && objects.includes(o));
+
+  // Check collisions every frame
+  if (objects.length > 1) checkCollisions();
+
+  // Update flash effects
+  flashEffects = flashEffects.filter(f => {
+    f.life -= dt;
+    if (f.life <= 0) { scene.remove(f.mesh); return false; }
+    const t = f.life / f.maxLife;
+    f.mesh.material.opacity = t * 0.9;
+    if (f.isRing) {
+      const s = 1 + (1 - t) * 5;
+      f.mesh.scale.setScalar(s);
+      f.mesh.lookAt(camera.position);
+    } else {
+      const s = 1 + (1 - t) * 2;
+      f.mesh.scale.setScalar(s);
+    }
+    return true;
+  });
+
+  updateTelemetry();
+
+  const sats = objects.filter(o => !o.isDebris);
+  const deb = objects.filter(o => o.isDebris);
+  document.getElementById('stat-sats').textContent = sats.length;
+  document.getElementById('stat-debris').textContent = deb.length;
+  document.getElementById('stat-colls').textContent = totalCollisions;
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();
+</script>
+</body>
+</html>
